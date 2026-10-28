@@ -1,7 +1,31 @@
 import { createServer } from "node:http";
 import { chromium } from "playwright";
 
-const port = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 3000);
+const TARGET = "https://arena.ai/";
+
+function detectChallenge(html, title) {
+  return /just a moment|cf-chl|checking your browser|challenge-platform/i.test(
+    html + " " + title
+  );
+}
+
+function getCloudflareHeaders(headers) {
+  const names = [
+    "cf-ray",
+    "cf-cache-status",
+    "cf-mitigated",
+    "server",
+    "content-type",
+    "retry-after"
+  ];
+
+  return Object.fromEntries(
+    names
+      .map(name => [name, headers[name]])
+      .filter(([, value]) => value !== undefined)
+  );
+}
 
 createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -9,38 +33,33 @@ createServer(async (req, res) => {
   if (req.url === "/") {
     res.end(JSON.stringify({
       status: "ready",
-      endpoints: {
-        http: "/test",
-        browser: "/browser"
-      }
+      endpoints: ["/test", "/browser", "/diagnostics"]
     }));
     return;
   }
 
-  // Original HTTP connectivity test
   if (req.url === "/test") {
     try {
-      const response = await fetch("https://arena.ai/", {
+      const response = await fetch(TARGET, {
         signal: AbortSignal.timeout(15000),
         redirect: "follow"
       });
 
-      const body = (await response.text()).slice(0, 100000);
-
-      const challenge =
-        /just a moment|cf-chl|checking your browser/i.test(body);
+      const html = (await response.text()).slice(0, 100000);
 
       res.end(JSON.stringify({
         method: "fetch",
         httpStatus: response.status,
-        finalUrl: response.url.split("?")[0],
-        cloudflareChallenge: challenge,
-        accessible: response.ok && !challenge
-      }));
+        finalUrl: response.url,
+        cloudflareChallenge: detectChallenge(html, ""),
+        accessible: response.ok && !detectChallenge(html, ""),
+        cloudflareHeaders: getCloudflareHeaders(
+          Object.fromEntries(response.headers)
+        )
+      }, null, 2));
 
     } catch (error) {
       res.end(JSON.stringify({
-        method: "fetch",
         accessible: false,
         error: error.message
       }));
@@ -49,13 +68,10 @@ createServer(async (req, res) => {
     return;
   }
 
-  // Chromium browser connectivity test
-  if (req.url === "/browser") {
+  if (req.url === "/browser" || req.url === "/diagnostics") {
     let browser;
 
     try {
-      console.log("[BROWSER] Launching Chromium...");
-
       browser = await chromium.launch({
         headless: true,
         args: [
@@ -71,9 +87,7 @@ createServer(async (req, res) => {
         }
       });
 
-      console.log("[BROWSER] Visiting Arena.ai...");
-
-      const response = await page.goto("https://arena.ai/", {
+      const response = await page.goto(TARGET, {
         waitUntil: "domcontentloaded",
         timeout: 60000
       });
@@ -81,25 +95,34 @@ createServer(async (req, res) => {
       await page.waitForTimeout(5000);
 
       const html = await page.content();
+      const title = await page.title();
 
-      const challenge =
-        /just a moment|cf-chl|checking your browser|challenge-platform/i.test(html);
+      const headers = response
+        ? await response.allHeaders()
+        : {};
 
-      res.end(JSON.stringify({
+      const challenge = detectChallenge(html, title);
+
+      const result = {
         method: "playwright",
         httpStatus: response?.status() || null,
         finalUrl: page.url(),
-        title: await page.title(),
+        title,
         cloudflareChallenge: challenge,
         accessible: response?.ok() && !challenge,
-        htmlLength: html.length,
-        browser: "Chromium",
+        cloudflareHeaders: getCloudflareHeaders(headers),
+        diagnostics: {
+          htmlLength: html.length,
+          userAgent: await page.evaluate(() => navigator.userAgent),
+          browserVersion: browser.version(),
+          timestamp: new Date().toISOString()
+        },
         hosting: "Render"
-      }));
+      };
+
+      res.end(JSON.stringify(result, null, 2));
 
     } catch (error) {
-      console.error("[BROWSER ERROR]", error);
-
       res.end(JSON.stringify({
         method: "playwright",
         accessible: false,
@@ -118,6 +141,6 @@ createServer(async (req, res) => {
   res.statusCode = 404;
   res.end(JSON.stringify({ error: "Not found" }));
 
-}).listen(port, "0.0.0.0", () => {
-  console.log(`Test server listening on ${port}`);
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`Cloudflare diagnostics server running on ${PORT}`);
 });
